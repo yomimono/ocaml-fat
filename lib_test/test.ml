@@ -322,10 +322,29 @@ let test_write ((filename: string), (offset, length)) () =
     let open FsError in
     MemFS.create fs filename >>= fun () ->
     let buffer = make_pattern "basic writing test " length in
-    MemFS.write fs filename 0 buffer >>= fun () ->
-    MemFS.read fs filename 0 512 >>= fun buffers ->
+    MemFS.write fs filename offset buffer >>= fun () ->
+    MemFS.read fs filename offset 512 >>= fun buffers ->
     let to_string x = Printf.sprintf "\"%s\"(%d)" (Cstruct.to_string x) (Cstruct.len x) in
     assert_equal ~printer:to_string ~cmp:cstruct_equal buffer (List.hd buffers);
+    return () in
+  Lwt_main.run t
+
+let test_overwrite () =
+  let t = 
+    let filename = "overwrite.me" in
+    let length = 512 in
+    let open BlockError in
+    MemoryIO.connect "" >>= fun device ->
+    let open FsError in
+    MemFS.connect device >>= fun fs ->
+    MemFS.format fs (Int64.mul 16L mib) >>= fun () ->
+    MemFS.create fs filename >>= fun () ->
+    let buffer = make_pattern "overwrite test!!" length in
+    let after_append = make_pattern "overwrite test!!" (length * 2) in
+    MemFS.write fs filename 0 buffer >>= fun () ->
+    MemFS.write fs filename 512 buffer >>= fun () ->
+    MemFS.read fs filename 0 1024 >>= fun buffers ->
+    assert_equal ~printer:Cstruct.to_string after_append (List.hd buffers);
     return () in
   Lwt_main.run t
 
@@ -366,5 +385,6 @@ let _ =
       "test_listdir_subdir" >:: test_listdir_subdir;
       "test_read" >:: test_read;
       "test_destroy" >:: test_destroy;
+      "test_overwrite" >:: test_overwrite;
     ] @ write_tests in
   run_test_tt_main suite
