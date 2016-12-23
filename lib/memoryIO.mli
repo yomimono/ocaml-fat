@@ -14,8 +14,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
 
-include S.BLOCK_DEVICE
-  with type 'a io = 'a Lwt.t
-   and type page_aligned_buffer = Cstruct.t
+include V1_LWT.BLOCK
 
 val connect : string -> t io

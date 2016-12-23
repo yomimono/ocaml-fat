@@ -15,7 +15,6 @@
  *)
 
 open Lwt
-open S
 open Mirage_block
 open Result
 
@@ -26,46 +25,16 @@ type fs = {
   root: Cstruct.t;
 }
 
-(*
-type block_error = [ `Unknown of string | `Unimplemented | `Is_read_only | `Disconnected ]
-
-let string_of_block_error = function
-  | `Unknown x -> Printf.sprintf "Unknown block error: %s" x
-  | `Unimplemented -> "Block device function is not implemented"
-  | `Is_read_only -> "Block device is read only"
-  | `Disconnected -> "Block device has been disconnected"
-
-type filesystem_error = [
-  | `Not_a_directory of string
-  | `Is_a_directory of string
-  | `Directory_not_empty of string
-  | `No_directory_entry of string * string
-  | `File_already_exists of string
-  | `No_space
-  | `Format_not_recognised of string
-  | `Unknown_error of string
-  | `Block_device of block_error
-]
-
-let string_of_filesystem_error = function
-| `Not_a_directory x -> Printf.sprintf "%s is not a directory" x
-| `Is_a_directory x -> Printf.sprintf "%s is a directory" x
-| `Directory_not_empty x -> Printf.sprintf "The directory %s is not empty" x
-| `No_directory_entry (x, y) -> Printf.sprintf "The directory %s contains no entry called %s" x y
-| `File_already_exists x -> Printf.sprintf "The filename %s already exists" x
-| `No_space -> "There is insufficient free space to complete this operation"
-| `Format_not_recognised x -> Printf.sprintf "This disk is not formatted with %s" x
-| `Unknown_error x -> Printf.sprintf "Unknown error: %s" x
-| `Block_device x -> string_of_block_error x
-*)
-
-module Make (B: BLOCK_DEVICE
-  with type 'a io = 'a Lwt.t
-  and type page_aligned_buffer = Cstruct.t)(M: IO_PAGE) = struct
+module Make (B: V1_LWT.BLOCK)(M: S.IO_PAGE) = struct
   type t = {
     device: B.t;
     fs: fs;
   }
+
+  type error = [ V1.Fs.error | `Block_read of B.error ]
+  type write_error = [ V1.Fs.write_error
+    | `Block_write of B.write_error
+    | `Block_read of B.error ]
 
   type 'a io = 'a Lwt.t
 
@@ -82,19 +51,17 @@ module Make (B: BLOCK_DEVICE
     size: int64;
   }
 
-  module BlockError = struct
-    let (>>=) m f = m >>= function
-    | Error (`Msg m) -> Lwt.return (Error (`Msg m))
-    | Error (#Mirage_block.write_error as e) ->
-      Lwt.return (Error (`Msg (Fmt.strf "%a" B.pp_write_error e)))
-    | Ok x -> f x
-  end
+  let pp_error ppf = function
+  | `Is_a_directory | `No_directory_entry | `Not_a_directory
+    as e -> Mirage_pp.pp_fs_error ppf e
+  | `Block_read err -> B.pp_error ppf err
 
-  let (>>|=) m f = m >>= function
-    | Error (`Msg m) -> Lwt.return (Error (`Msg m))
-    | Error (#Mirage_block.write_error as e) ->
-      Lwt.return (Error (`Msg (Fmt.strf "%a" B.pp_write_error e)))
-    | Ok x -> f x
+  let pp_write ppf = function
+  | `Is_a_directory | `No_directory_entry | `Not_a_directory
+    as e -> Mirage_pp.pp_fs_error ppf e
+  | `File_already_exists | `No_space as e -> Mirage_pp.pp_fs_write_error ppf e
+  | `Block_write err -> B.pp_write_error ppf err
+  | `Block_read err -> B.pp_error ppf err
 
   let rec iter_s f = function
     | [] -> Lwt.return (Ok ())
@@ -103,12 +70,15 @@ module Make (B: BLOCK_DEVICE
       | Error e -> Lwt.return (Error e)
       | Ok () -> iter_s f xs
 
+  let (>>*=) x f =
+    x >>= function | Ok m -> f m | Error e -> Lwt.return @@ Error e
+
   let alloc bytes =
     let pages = M.get_buf ~n:((bytes + 4095) / 4096) () in
     Cstruct.sub pages 0 bytes
 
   (* TODO: this function performs extra data copies *)
-  let read_sectors bps device xs: (Cstruct.t, [> `Msg of string ]) Result.result Lwt.t=
+  let read_sectors bps device xs : (Cstruct.t, error) result io =
     let buf = alloc (List.length xs * 512) in
     let rec split buf =
       if Cstruct.len buf = 0 then []
@@ -116,32 +86,41 @@ module Make (B: BLOCK_DEVICE
       else Cstruct.sub buf 0 512 :: (split (Cstruct.shift buf 512)) in
 
     let page = alloc 4096 in
-    B.get_info device >>= fun info ->
-    let rec loop = function
+    let rec loop sector_size = function
       | [] -> return (Ok ())
       | (sector, buffer) :: xs ->
         let offset = sector * bps in
-        let sector' = offset / info.sector_size in
-        B.read device (Int64.of_int sector') [ page ] >>|= fun () ->
-        Cstruct.blit page (offset mod info.B.sector_size) buffer 0 512;
-        loop xs in
-    loop (List.combine xs (split buf)) >>|= fun () ->
-    return (Ok buf)
+        let sector' = offset / sector_size in
+        Cstruct.memset page 0;
+        B.read device (Int64.of_int sector') [ page ] >>= function
+        | Error e -> Lwt.return (Error (`Block_read e))
+        | Ok () ->
+          Cstruct.blit page (offset mod sector_size) buffer 0 512;
+          loop sector_size xs
+    in
+    B.get_info device >>= fun {sector_size; _} ->
+    loop sector_size (List.combine xs (split buf)) >>*= fun () -> return (Ok buf)
 
   let write_update device fs ({ Update.offset = offset; data = data } as update) =
+    let overwrite_sector ~block_number ~sector_offset ~sector_number
+       ~sectors_per_block ~bps page =
+      let sector = Cstruct.sub page (Int64.(to_int (rem sector_number (of_int sectors_per_block))) * bps) bps in
+      Update.apply sector { update with Update.offset = sector_offset };
+      B.write device block_number [ page ] >>= function
+      | Error e -> Lwt.return @@ Error (`Block_write e)
+      | Ok () -> Lwt.return @@ Ok ()
+    in
     B.get_info device >>= fun info ->
     let bps = fs.boot.Boot_sector.bytes_per_sector in
     let sector_number = Int64.(div offset (of_int bps)) in
     let sector_offset = Int64.(sub offset (mul sector_number (of_int bps))) in
     (* number of 512-byte FAT sectors per physical disk sectors *)
-    let sectors_per_block = info.B.sector_size / bps in
+    let sectors_per_block = info.sector_size / bps in
     let page = alloc 4096 in
-    let sector_number' = Int64.(div sector_number (of_int sectors_per_block)) in
-    B.read device sector_number' [ page ] >>|= fun () ->
-    let sector = Cstruct.sub page (Int64.(to_int (rem sector_number (of_int sectors_per_block))) * bps) bps in
-    Update.apply sector { update with Update.offset = sector_offset };
-    B.write device sector_number' [ page ] >>|= fun () ->
-    return (Ok ())
+    let block_number = Int64.(div sector_number (of_int sectors_per_block)) in
+    B.read device block_number [ page ] >>= function
+    | Error e -> Lwt.return @@ Error (`Block_read e)
+    | Ok () -> overwrite_sector ~block_number ~sector_offset ~sector_number ~sectors_per_block ~bps page
 
   let make size =
     let open Rresult in
@@ -168,10 +147,6 @@ module Make (B: BLOCK_DEVICE
     let sector = alloc 512 in
     Boot_sector.marshal sector fs.boot;
 
-    let to_string list =
-      String.concat ", " (List.map (fun e -> Printf.sprintf "%d" e) list)
-    in
-
     let fat_sectors = Boot_sector.sectors_of_fat fs.boot in
     let fat_writes = Update.(
         let updates = split (from_cstruct 0L fs.fat) 512 in
@@ -183,29 +158,34 @@ module Make (B: BLOCK_DEVICE
     let root_writes = Update.(map (split (from_cstruct 0L fs.root) 512) root_sectors 512) in
 
     let t = { device; fs } in
-    write_update device fs (Update.from_cstruct 0L sector) >>|= fun () ->
-    iter_s (write_update device fs) fat_writes >>|= fun () ->
-    iter_s (write_update device fs) root_writes >>|= fun () ->
+    write_update device fs (Update.from_cstruct 0L sector) >>*= fun () ->
+    iter_s (write_update device fs) fat_writes >>*= fun () ->
+    iter_s (write_update device fs) root_writes >>*= fun () ->
     return (Ok t)
 
   let connect device =
-    let (>>!=) x f =
-      x >>= function | Ok y -> f y | Error e -> fail @@ (Failure (Format.asprintf "Block error: %a" Mirage_pp.pp_block_error e))
-    in
-    let page = alloc 4096 in
-    B.get_info device >>= fun info ->
-    let sector = Cstruct.sub page 0 info.B.sector_size in
-    B.read device 0L [ sector ] >>!= fun () ->
-    ( match Boot_sector.unmarshal sector with
-      | Error reason -> fail @@ Failure ("error reading first sector of block device: " ^ reason)
+    let get_fs sector =
+      match Boot_sector.unmarshal sector with
+      | Error reason -> fail @@ Failure ("error unmarshalling first sector of block device: " ^ reason)
       | Ok boot ->
         match Boot_sector.detect_format boot with
         | Error reason -> fail @@ Failure ("error detecting the format of block device: " ^ reason)
-        | Ok format ->
-          read_sectors boot.Boot_sector.bytes_per_sector device (Boot_sector.sectors_of_fat boot) >>!= fun fat ->
-          read_sectors boot.Boot_sector.bytes_per_sector device (Boot_sector.sectors_of_root_dir boot) >>!= fun root ->
-          return { boot; format; fat; root } )
-    >>= fun fs -> return { device; fs }
+        | Ok format -> Lwt.return (boot, format)
+    in
+    let page = alloc 4096 in
+    B.get_info device >>= fun info ->
+    let sector = Cstruct.sub page 0 info.sector_size in
+    (B.read device 0L [ sector ] >>= function
+      | Error e -> Lwt.return (Error (`Block_read e))
+      | Ok () ->
+      get_fs sector >>= fun (boot, format) ->
+      read_sectors boot.Boot_sector.bytes_per_sector device (Boot_sector.sectors_of_fat boot) >>*= fun fat ->
+      read_sectors boot.Boot_sector.bytes_per_sector device (Boot_sector.sectors_of_root_dir boot) >>*= fun root ->
+      return (Ok { device; fs = { boot; format; fat; root } }))
+    >>= function
+    | Error e -> fail @@ Failure (Format.asprintf "error reading essential sectors: %a"
+                         pp_error e)
+    | Ok t -> Lwt.return t
 
   let disconnect _ = return ()
 
@@ -227,20 +207,20 @@ module Make (B: BLOCK_DEVICE
     let readdir = function
       | Dir ds -> return (Ok ds)
       | File d ->
-        read_whole_file device fs d >>|= fun buf ->
+        read_whole_file device fs d >>*= fun buf ->
         return (Ok (Name.list buf)) in
     let rec inner sofar current = function
       | [] ->
         begin match current with
           | Dir ds -> return (Ok (Dir ds))
           | File { Name.dos = _, { Name.subdir = true } } ->
-            readdir current >>|= fun names ->
+            readdir current >>*= fun names ->
             return (Ok (Dir names))
           | File ( { Name.dos = _, { Name.subdir = false } } as d ) ->
             return (Ok (File d))
         end
       | p :: ps ->
-        readdir current >>|= fun entries ->
+        readdir current >>*= fun entries ->
         begin match Name.find p entries, ps with
           | Some { Name.dos = _, { Name.subdir = false } }, _ :: _ ->
             return (Error `Not_a_directory)
@@ -281,7 +261,7 @@ module Make (B: BLOCK_DEVICE
 
     (* return the storage location of the object identified by [path] *)
     let of_file device fs path =
-      chain_of_file device fs path >>|= function
+      chain_of_file device fs path >>*= function
       | None -> return (Ok Rootdir)
       | Some c -> return (Ok (Chain c))
 
@@ -291,21 +271,11 @@ module Make (B: BLOCK_DEVICE
 
   end
 
-  let (>>||=) m f = m >>= function
-    | Error (`Msg m) -> Lwt.return (Error (`Msg m))
-    | Error `Is_a_directory -> Lwt.return (Error `Is_a_directory)
-    | Error `Not_a_directory -> Lwt.return (Error `Not_a_directory)
-    | Error `Directory_not_empty -> Lwt.return (Error `Directory_not_empty)
-    | Error `File_already_exists -> Lwt.return (Error `File_already_exists)
-    | Error `No_directory_entry -> Lwt.return (Error `No_directory_entry)
-    | Error `No_space -> Lwt.return (Error `No_space)
-    | Ok x -> f x
-
   (** [write_to_location device fs path location update] applies [update]
       to the data stored in the object at [path] which is currently
       stored at [location]. If [location] is a chain of clusters then
       it will be extended. *)
-  let rec write_to_location device fs path location update =
+  let rec write_to_location device fs path location update : (unit, write_error) result Lwt.t =
     let bps = fs.boot.Boot_sector.bytes_per_sector in
     let spc = fs.boot.Boot_sector.sectors_per_cluster in
     let updates = Update.split update bps in
@@ -318,12 +288,12 @@ module Make (B: BLOCK_DEVICE
     let clusters_needed =
       let bpc = Int64.of_int(spc * bps) in
       Int64.(to_int(div (add bytes_needed (sub bpc 1L)) bpc)) in
-    ( match location, bytes_needed > 0L with
+    let resolve_location = function
       | Location.Rootdir, true ->
         return (Error `No_space)
       | (Location.Rootdir | Location.Chain _), false ->
         let writes = Update.map updates sectors bps in
-        iter_s (write_update device fs) writes >>|= fun () ->
+        iter_s (write_update device fs) writes >>*= fun () ->
         if location = Location.Rootdir then Update.apply fs.root update;
         return (Ok location)
       | Location.Chain cs, true ->
@@ -332,11 +302,12 @@ module Make (B: BLOCK_DEVICE
         let fat_sectors = Boot_sector.sectors_of_fat fs.boot in
         let new_sectors = Entry.Chain.to_sectors fs.boot new_clusters in
         let data_writes = Update.map updates (sectors @ new_sectors) bps in
-        iter_s (write_update device fs) data_writes >>|= fun () ->
+        iter_s (write_update device fs) data_writes >>*= fun () ->
         let fat_writes = Update.(map (split (from_cstruct 0L fs.fat) bps) fat_sectors bps) in
-        iter_s (write_update device fs) fat_writes >>|= fun () ->
-        return (Ok (Location.Chain (cs @ new_clusters))) )  >>||= fun location ->
-    match location with
+        iter_s (write_update device fs) fat_writes >>*= fun () ->
+        return (Ok (Location.Chain (cs @ new_clusters)))
+    in
+    resolve_location (location, bytes_needed > 0L) >>*= function
     | Location.Chain [] ->
       (* In the case of a previously empty file (location = Chain []), we
          have extended the chain (location = Chain (_ :: _)) so it's safe to
@@ -359,16 +330,14 @@ module Make (B: BLOCK_DEVICE
 
   and update_directory_containing device fs path f =
     let parent_path = Path.directory path in
-    find device fs parent_path >>||= function
+    find device fs parent_path >>*= function
       | File _ -> Lwt.return (Error `Not_a_directory)
       | Dir ds ->
-        Location.of_file device fs parent_path >>|= fun location ->
+        Location.of_file device fs parent_path >>*= fun location ->
         let sectors = Location.to_sectors fs location in
-        read_sectors fs.boot.Boot_sector.bytes_per_sector device sectors >>= function
-        | Error (`Msg m) -> return (Error (`Msg m))
-        | Ok contents ->
-        f contents ds >>||= fun updates ->
-        iter_s (write_to_location device fs parent_path location) updates >>||= fun () ->
+        read_sectors fs.boot.Boot_sector.bytes_per_sector device sectors >>*= fun contents ->
+        f contents ds >>*= fun updates ->
+        iter_s (write_to_location device fs parent_path location) updates >>*= fun () ->
         return (Ok ())
 
   let create_common x path dir_entry =
